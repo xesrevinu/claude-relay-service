@@ -128,8 +128,18 @@ class UnifiedOpenAIScheduler {
   }
 
   // 🎯 统一调度OpenAI账号
-  async selectAccountForApiKey(apiKeyData, sessionHash = null, requestedModel = null) {
+  async selectAccountForApiKey(
+    apiKeyData,
+    sessionHash = null,
+    requestedModel = null,
+    options = {}
+  ) {
     try {
+      const allowedAccountTypes =
+        Array.isArray(options.allowedAccountTypes) && options.allowedAccountTypes.length > 0
+          ? options.allowedAccountTypes
+          : ['openai', 'openai-responses']
+
       // 如果API Key绑定了专属账户或分组，优先使用
       if (apiKeyData.openaiAccountId) {
         // 检查是否是分组
@@ -154,6 +164,14 @@ class UnifiedOpenAIScheduler {
           // 普通 OpenAI 账户
           boundAccount = await openaiAccountService.getAccount(apiKeyData.openaiAccountId)
           accountType = 'openai'
+        }
+
+        if (!allowedAccountTypes.includes(accountType)) {
+          const error = new Error(
+            `Dedicated account type ${accountType} is not allowed for this operation`
+          )
+          error.statusCode = 403
+          throw error
         }
 
         const isActiveBoundAccount =
@@ -281,10 +299,10 @@ class UnifiedOpenAIScheduler {
         const mappedAccount = await this._getSessionMapping(sessionHash)
         if (mappedAccount) {
           // 验证映射的账户是否仍然可用
-          const isAvailable = await this._isAccountAvailable(
-            mappedAccount.accountId,
-            mappedAccount.accountType
-          )
+          const isAllowed = allowedAccountTypes.includes(mappedAccount.accountType)
+          const isAvailable =
+            isAllowed &&
+            (await this._isAccountAvailable(mappedAccount.accountId, mappedAccount.accountType))
           if (isAvailable) {
             // 🚀 智能会话续期（续期 unified 映射键，按配置）
             await this._extendSessionMappingTTL(sessionHash)
@@ -296,7 +314,7 @@ class UnifiedOpenAIScheduler {
             return mappedAccount
           } else {
             logger.warn(
-              `⚠️ Mapped account ${mappedAccount.accountId} is no longer available, selecting new account`
+              `⚠️ Mapped account ${mappedAccount.accountId} is no longer available or allowed, selecting new account`
             )
             await this._deleteSessionMapping(sessionHash)
           }
@@ -304,7 +322,10 @@ class UnifiedOpenAIScheduler {
       }
 
       // 获取所有可用账户
-      const availableAccounts = await this._getAllAvailableAccounts(apiKeyData, requestedModel)
+      let availableAccounts = await this._getAllAvailableAccounts(apiKeyData, requestedModel)
+      availableAccounts = availableAccounts.filter((account) =>
+        allowedAccountTypes.includes(account.accountType)
+      )
 
       if (availableAccounts.length === 0) {
         // 提供更详细的错误信息

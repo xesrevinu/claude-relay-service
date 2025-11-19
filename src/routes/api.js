@@ -6,12 +6,16 @@ const ccrRelayService = require('../services/ccrRelayService')
 const bedrockAccountService = require('../services/bedrockAccountService')
 const unifiedClaudeScheduler = require('../services/unifiedClaudeScheduler')
 const apiKeyService = require('../services/apiKeyService')
+const unifiedOpenAIScheduler = require('../services/unifiedOpenAIScheduler')
+const openaiResponsesAccountService = require('../services/openaiResponsesAccountService')
+const openaiResponsesRelayService = require('../services/openaiResponsesRelayService')
 const { authenticateApiKey } = require('../middleware/auth')
 const logger = require('../utils/logger')
 const { getEffectiveModel, parseVendorPrefixedModel } = require('../utils/modelHelper')
 const sessionHelper = require('../utils/sessionHelper')
 const { updateRateLimitCounters } = require('../utils/rateLimitHelper')
 const { sanitizeUpstreamError } = require('../utils/errorSanitizer')
+const crypto = require('crypto')
 const router = express.Router()
 
 function queueRateLimitUpdate(rateLimitInfo, usageSummary, model, context = '') {
@@ -61,6 +65,8 @@ async function handleMessagesRequest(req, res) {
       req._concurrencyRetryAttempted = false
     }
 
+    const skipMessageValidation = req.bypassClaudeMessageValidation === true
+
     // 严格的输入验证
     if (!req.body || typeof req.body !== 'object') {
       return res.status(400).json({
@@ -69,18 +75,20 @@ async function handleMessagesRequest(req, res) {
       })
     }
 
-    if (!req.body.messages || !Array.isArray(req.body.messages)) {
-      return res.status(400).json({
-        error: 'Invalid request',
-        message: 'Missing or invalid field: messages (must be an array)'
-      })
-    }
+    if (!skipMessageValidation) {
+      if (!req.body.messages || !Array.isArray(req.body.messages)) {
+        return res.status(400).json({
+          error: 'Invalid request',
+          message: 'Missing or invalid field: messages (must be an array)'
+        })
+      }
 
-    if (req.body.messages.length === 0) {
-      return res.status(400).json({
-        error: 'Invalid request',
-        message: 'Messages array cannot be empty'
-      })
+      if (req.body.messages.length === 0) {
+        return res.status(400).json({
+          error: 'Invalid request',
+          message: 'Messages array cannot be empty'
+        })
+      }
     }
 
     // 模型限制（黑名单）校验：统一在此处处理（去除供应商前缀）
@@ -812,6 +820,147 @@ router.post('/v1/messages', authenticateApiKey, handleMessagesRequest)
 
 // 🚀 Claude API messages 端点 - /claude/v1/messages (别名)
 router.post('/claude/v1/messages', authenticateApiKey, handleMessagesRequest)
+
+// 🚀 OpenAI-Responses API 端点 - /api/openai/responses
+async function handleOpenAIResponsesProxy(req, res) {
+  try {
+    if (
+      req.apiKey.permissions &&
+      req.apiKey.permissions !== 'all' &&
+      req.apiKey.permissions !== 'openai'
+    ) {
+      return res.status(403).json({
+        error: {
+          type: 'permission_error',
+          message: '此 API Key 无权访问 OpenAI 服务'
+        }
+      })
+    }
+
+    if (!req.body || typeof req.body !== 'object') {
+      return res.status(400).json({
+        error: {
+          type: 'invalid_request_error',
+          message: '请求体必须为有效的 JSON 对象'
+        }
+      })
+    }
+
+    const sessionId =
+      req.headers['session_id'] ||
+      req.headers['x-session-id'] ||
+      req.body?.session_id ||
+      req.body?.conversation_id ||
+      null
+
+    const sessionHash = crypto.createHash('sha256').update(String(sessionId)).digest('hex')
+
+    let accountSelection
+    try {
+      accountSelection = await unifiedOpenAIScheduler.selectAccountForApiKey(
+        req.apiKey,
+        sessionHash,
+        req.body?.model || null,
+        { allowedAccountTypes: ['openai-responses'] }
+      )
+    } catch (error) {
+      logger.error('❌ Failed to select OpenAI-Responses account:', error)
+      const status = error.statusCode || 500
+      return res.status(status).json({
+        error: {
+          type: status === 403 ? 'permission_error' : 'server_error',
+          message: error.message || '无法获取可用的 OpenAI-Responses 账号'
+        }
+      })
+    }
+
+    if (!accountSelection || !accountSelection.accountId) {
+      return res.status(503).json({
+        error: {
+          type: 'no_account_available',
+          message: '暂无可用的 OpenAI-Responses 账号'
+        }
+      })
+    }
+
+    if (accountSelection.accountType !== 'openai-responses') {
+      logger.error(
+        `❌ Unexpected account type for OpenAI-Responses route: ${accountSelection.accountType}`
+      )
+      return res.status(500).json({
+        error: {
+          type: 'server_error',
+          message: '调度的账号类型不匹配'
+        }
+      })
+    }
+
+    const account = await openaiResponsesAccountService.getAccount(accountSelection.accountId)
+    if (!account) {
+      return res.status(404).json({
+        error: {
+          type: 'account_not_found',
+          message: 'OpenAI-Responses 账号不存在或不可用'
+        }
+      })
+    }
+
+    logger.api(
+      `🚀 Forwarding OpenAI-Responses request via account: ${account.name} (${account.id})`
+    )
+
+    return await openaiResponsesRelayService.handleRequest(req, res, account, req.apiKey)
+  } catch (error) {
+    logger.error('❌ OpenAI-Responses proxy error:', error)
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: {
+          type: 'server_error',
+          message: error.message || 'Internal server error'
+        }
+      })
+    }
+  }
+}
+
+// 🚀 通用转发端点 - /relay/:provider
+function normalizeRelaySubPath(rawPath) {
+  if (!rawPath || rawPath === '/' || rawPath.trim() === '') {
+    return '/'
+  }
+  return rawPath.startsWith('/') ? rawPath : `/${rawPath}`
+}
+
+async function handleRelayRequest(req, res) {
+  const provider = (req.params.provider || '').toLowerCase()
+  const rawSubPath = req.params[0] || ''
+  const relaySubPath = normalizeRelaySubPath(rawSubPath)
+
+  if (!provider) {
+    return res.status(400).json({
+      error: {
+        type: 'invalid_request_error',
+        message: 'Missing provider in path'
+      }
+    })
+  }
+
+  if (provider === 'openai') {
+    logger.api(`🔁 Relay request routed to OpenAI-Responses handler (${provider})`)
+    req.relayUpstreamPath = relaySubPath
+    console.log(req.relayUpstreamPath)
+    return handleOpenAIResponsesProxy(req, res)
+  }
+
+  return res.status(400).json({
+    error: {
+      type: 'unsupported_provider',
+      message: `Unsupported relay provider: ${provider}`
+    }
+  })
+}
+
+router.all('/relay/:provider*', authenticateApiKey, handleRelayRequest)
 
 // 📋 模型列表端点 - 支持 Claude, OpenAI, Gemini
 router.get('/v1/models', authenticateApiKey, async (req, res) => {

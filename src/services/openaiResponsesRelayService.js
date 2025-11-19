@@ -70,7 +70,13 @@ class OpenAIResponsesRelayService {
       res.once('close', handleClientDisconnect)
 
       // 构建目标 URL
-      const targetUrl = `${fullAccount.baseApi}${req.path}`
+      const relayPath = req.relayUpstreamPath
+      const normalizedPath =
+        typeof relayPath === 'string' && relayPath.length > 0 ? relayPath : req.path || '/'
+      const pathWithLeadingSlash = normalizedPath.startsWith('/')
+        ? normalizedPath
+        : `/${normalizedPath}`
+      const targetUrl = `${fullAccount.baseApi}${pathWithLeadingSlash}`
       logger.info(`🎯 Forwarding to: ${targetUrl}`)
 
       // 构建请求头
